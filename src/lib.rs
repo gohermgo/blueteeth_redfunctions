@@ -101,12 +101,6 @@ impl DeviceSearcher {
         let Ok(device) = device_future.await else {
             return None;
         };
-        // let handler: BLStatusHandler = TypedEventHandler::new(move |devopt: &Option<BluetoothLEDevice>, _args &Option<IInspectable>| {
-        //     if let Some(device) = devopt {
-        //         let connected: bool = device.ConnectionStatus().ok
-        //     };
-        //     Ok(())
-        // });
         let handler = TypedEventHandler::new(Self::INVOKE);
         let Ok(token) = device.ConnectionStatusChanged(&handler) else {
             return None;
@@ -126,19 +120,6 @@ impl DeviceSearcher {
         let Ok(device) = device_future.await else {
             return None;
         };
-        // let verifier: StatusVerifier = Box::new(|status| println!("{}", status));
-        // let handler: BLStatusHandler = TypedEventHandler::new(
-        //     move |devopt: &Option<BluetoothLEDevice>, _args: &Option<IInspectable>| {
-        //         if let Some(device) = devopt {
-        //             let connected: bool = device.ConnectionStatus().ok().map_or(false, |status| {
-        //                 status == BluetoothConnectionStatus::Connected
-        //             });
-        //             verifier(connected);
-        //         };
-
-        //         Ok(())
-        //     },
-        // );
         let handler = TypedEventHandler::new(Self::INVOKE);
         let Ok(token) = device.ConnectionStatusChanged(&handler) else {
             return None;
