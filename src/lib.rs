@@ -1,7 +1,7 @@
 use std::{borrow::BorrowMut, error::Error};
 
 use btleplug::{
-    api::{bleuuid::BleUuid, Central, CentralEvent, Manager as _, ScanFilter},
+    api::{bleuuid::BleUuid, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter},
     platform::{Adapter, Manager, Peripheral},
 };
 use futures::stream::StreamExt;
@@ -103,43 +103,73 @@ impl BluetoothScanner {
             discovery_rx: rx,
         })
     }
-    pub fn start(mut self) -> anyhow::Result<PeripheralHandler> {
-        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+    pub fn start(mut self) -> anyhow::Result<PeripheralTerminal> {
         let (peripheral_tx, peripheral_rx) =
             tokio::sync::mpsc::channel(std::mem::size_of::<Peripheral>());
         let adapter = self.adapter.clone();
         tokio::task::spawn(async move {
             let _ = adapter.start_scan(ScanFilter::default()).await.unwrap();
             loop {
-                match (self.discovery_rx.recv().await, stop_rx.try_recv()) {
-                    (Some(p), Err(TryRecvError::Closed)) | (Some(p), Ok(())) => {
-                        peripheral_tx.send(p).await.unwrap();
-                        break;
-                    }
-                    (Some(p), _) => match peripheral_tx.send(p).await {
+                match self.discovery_rx.recv().await {
+                    Some(p) => match peripheral_tx.send(p).await {
                         Ok(()) => continue,
                         // We closed the receiver
                         _ => break,
                     },
-                    (None, Err(TryRecvError::Closed)) | (_, Ok(())) => break,
-                    (None, _) => continue,
+                    None => continue,
                 }
             }
         });
-        Ok(PeripheralHandler {
-            stop_tx,
-            peripheral_rx,
-        })
+        Ok(PeripheralTerminal { peripheral_rx })
     }
 }
-impl Drop for BluetoothScanner {
-    fn drop(&mut self) {
-        self.discovery_rx.close()
-    }
-}
-pub struct PeripheralHandler {
-    stop_tx: tokio::sync::oneshot::Sender<()>,
+// impl Drop for BluetoothScanner {
+//     fn drop(&mut self) {
+//         self.discovery_rx.close()
+//     }
+// }
+pub struct PeripheralTerminal {
     peripheral_rx: tokio::sync::mpsc::Receiver<Peripheral>,
+}
+impl PeripheralTerminal {
+    pub fn new() -> anyhow::Result<Self> {
+        let bt_scanner = BluetoothScanner::new()?;
+        bt_scanner.start()
+    }
+    pub fn filter_reception(mut self, query: DeviceQuery) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<Peripheral>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::task::spawn(async move {
+            loop {
+                let (props, p)= match self.peripheral_rx.recv().await {
+                    Some(p) => (p.properties().await.unwrap().unwrap(), p),
+                    None => continue
+                };
+                match query {
+                    DeviceQuery::ByName(ref name) if props.local_name.unwrap_or_default().eq(name) => tx.send(p).unwrap(),
+                    DeviceQuery::ByUuid(uuid) if props.services.into_iter().find(|value| value.eq(&uuid)).is_some() => tx.send(p).unwrap(),
+                    DeviceQuery::ByAddress(ref addr) if props.address.to_string().eq(addr) => tx.send(p).unwrap(),
+                    _ => continue
+                }
+            }
+        });
+        Ok(rx)
+    }
+}
+impl Drop for PeripheralTerminal {
+    fn drop(&mut self) {
+        self.peripheral_rx.close();
+    }
+}
+pub struct PeripheralSearcher {
+    terminal: PeripheralTerminal
+}
+impl PeripheralSearcher {
+    pub fn new() -> anyhow::Result<Self> {
+        let x = tokio::task::spawn()
+    }
+    pub fn search_by(self, query: DeviceQuery) -> anyhow::Result<Peripheral> {
+        todo!()
+    }
 }
 
 pub fn add(left: usize, right: usize) -> usize {
