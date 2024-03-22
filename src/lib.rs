@@ -5,7 +5,9 @@ use btleplug::{
     platform::{Adapter, Manager, Peripheral},
 };
 use futures::stream::StreamExt;
+use futures::FutureExt;
 use std::sync::Arc;
+use tokio::sync::oneshot::error::TryRecvError;
 
 use uuid::Uuid;
 
@@ -101,23 +103,33 @@ impl BluetoothScanner {
             discovery_rx: rx,
         })
     }
-    pub fn start(mut self) -> anyhow::Result<tokio::sync::mpsc::Receiver<Peripheral>> {
-        let (tx, rx) = tokio::sync::mpsc::channel(std::mem::size_of::<Peripheral>());
+    pub fn start(mut self) -> anyhow::Result<PeripheralHandler> {
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let (peripheral_tx, peripheral_rx) =
+            tokio::sync::mpsc::channel(std::mem::size_of::<Peripheral>());
         let adapter = self.adapter.clone();
         tokio::task::spawn(async move {
             let _ = adapter.start_scan(ScanFilter::default()).await.unwrap();
             loop {
-                match self.discovery_rx.recv().await {
-                    Some(p) => match tx.send(p).await {
+                match (self.discovery_rx.recv().await, stop_rx.try_recv()) {
+                    (Some(p), Err(TryRecvError::Closed)) | (Some(p), Ok(())) => {
+                        peripheral_tx.send(p).await.unwrap();
+                        break;
+                    }
+                    (Some(p), _) => match peripheral_tx.send(p).await {
                         Ok(()) => continue,
                         // We closed the receiver
                         _ => break,
                     },
-                    None => continue,
+                    (None, Err(TryRecvError::Closed)) | (_, Ok(())) => break,
+                    (None, _) => continue,
                 }
             }
         });
-        Ok(rx)
+        Ok(PeripheralHandler {
+            stop_tx,
+            peripheral_rx,
+        })
     }
 }
 impl Drop for BluetoothScanner {
@@ -126,7 +138,8 @@ impl Drop for BluetoothScanner {
     }
 }
 pub struct PeripheralHandler {
-    peripheral: Peripheral,
+    stop_tx: tokio::sync::oneshot::Sender<()>,
+    peripheral_rx: tokio::sync::mpsc::Receiver<Peripheral>,
 }
 
 pub fn add(left: usize, right: usize) -> usize {
