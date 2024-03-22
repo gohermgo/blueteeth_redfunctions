@@ -1,3 +1,4 @@
+//! This is really cool no?
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::SendError;
 use windows::{
