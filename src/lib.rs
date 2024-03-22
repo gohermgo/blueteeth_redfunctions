@@ -1,188 +1,175 @@
-use std::{borrow::BorrowMut, error::Error};
-
-use btleplug::{
-    api::{bleuuid::BleUuid, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter},
-    platform::{Adapter, Manager, Peripheral},
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::error::SendError;
+use windows::{
+    core::{IInspectable, GUID, HSTRING},
+    Devices::Bluetooth::{
+        Advertisement::{
+            BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementWatcher,
+        },
+        BluetoothConnectionStatus, BluetoothLEDevice,
+        GenericAttributeProfile::GattDeviceService,
+    },
+    Foundation::{EventRegistrationToken, TypedEventHandler},
 };
-use futures::stream::StreamExt;
-use futures::FutureExt;
-use std::sync::Arc;
-use tokio::sync::oneshot::error::TryRecvError;
 
-use uuid::Uuid;
+pub struct DeviceAddress {
+    address: [u8; 6],
+}
 
-async fn disconnect_handler() -> anyhow::Result<()> {
-    todo!()
+impl From<DeviceAddress> for u64 {
+    fn from(addr: DeviceAddress) -> Self {
+        let mut slice = [0; 8];
+        slice[2..].copy_from_slice(&addr.address);
+        u64::from_be_bytes(slice)
+    }
 }
-pub enum DeviceQuery {
-    ByName(String),
-    ByUuid(Uuid),
-    ByAddress(String),
-}
-pub struct BluetoothEventWatcher;
-pub struct ManagedAdapter {
-    manager: Manager,
-    adapter: Adapter,
-}
-async fn get_central_adapter() -> Result<Adapter, btleplug::Error> {
-    let m = Manager::new().await?;
-    m.adapters()
-        .await?
-        .into_iter()
-        .nth(0)
-        .ok_or(btleplug::Error::RuntimeError(
-            "Failed to get central adapter".into(),
-        ))
-}
-async fn get_managed_peripheral(
-) -> Result<(Manager, <Adapter as Central>::Peripheral), btleplug::Error> {
-    // let (manager, adapter) = get_adapter().await?;
+pub struct DeviceSniffer {}
+impl DeviceSniffer {
+    const TARGET: GUID = GUID::zeroed();
+    pub fn sniff(
+        guid_tx: tokio::sync::mpsc::UnboundedSender<GUID>,
+        token_tx: tokio::sync::mpsc::UnboundedSender<EventRegistrationToken>,
+    ) -> windows::core::Result<()> {
+        let watcher = BluetoothLEAdvertisementWatcher::new()?;
+        let token_handler = TypedEventHandler::new(
+            move |_, opt_args: &Option<BluetoothLEAdvertisementReceivedEventArgs>| {
+                if let Some(args) = opt_args {
+                    let advertisement = args.Advertisement()?;
+                    let service_uuids = advertisement.ServiceUuids()?;
 
-    todo!()
-}
-// impl ManagedAdapter {
-//     pub fn new() -> anyhow::Result<Self> {
-//         // Get manager
-//         let (tx, rx) = std::sync::mpsc::channel();
-//         tokio::task::spawn(async move {
-//             let _ = tx.send(get_central_adapter().await);
-//         });
-
-//         Ok(ManagedAdapter {
-//             manager,
-//             adapter: adapters,
-//         })
-//     }
-//     pub fn start_scan(&self) -> anyhow::Result<BluetoothScanner> {
-//         tokio::task::spawn(async move {
-//             for adapter in self.adapter {
-//                 adapter
-//                     .start_scan(ScanFilter::default())
-//                     .await
-//                     .unwrap_or_default()
-//             }
-//         });
-//         todo!()
-//     }
-//     pub fn peripherals(&self) -> anyhow::Result<<Adapter as Central>::Peripheral> {
-//         todo!()
-//     }
-// }
-pub struct BluetoothScanner {
-    adapter: std::sync::Arc<Adapter>,
-    discovery_rx: tokio::sync::mpsc::Receiver<Peripheral>,
-}
-impl BluetoothScanner {
-    pub fn new() -> anyhow::Result<Self> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        tokio::task::spawn(async move {
-            let _ = tx.send(get_central_adapter().await);
-        });
-        let adapter_arc = Arc::new(rx.recv()??);
-        let adapter = adapter_arc.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        tokio::task::spawn(async move {
-            let _ = tx.send(adapter.events().await);
-        });
-        let mut event_stream = rx.recv()??;
-        let adapter = adapter_arc.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel(std::mem::size_of::<Peripheral>());
-        tokio::task::spawn(async move {
-            while let Some(event) = event_stream.next().await {
-                match event {
-                    CentralEvent::DeviceDiscovered(id) => {
-                        let peripheral = adapter.peripheral(&id).await.unwrap();
-                        tx.send(peripheral).await.unwrap_or_default()
+                    for uuid in service_uuids {
+                        if uuid == Self::TARGET {
+                            guid_tx
+                                .send(uuid)
+                                .map_err(|_send| windows::core::Error::from_win32())?;
+                        }
                     }
-                    _ => continue,
                 }
-            }
-        });
-        Ok(Self {
-            adapter: adapter_arc,
-            discovery_rx: rx,
+
+                Ok(())
+            },
+        );
+        let token = watcher.Received(&token_handler)?;
+        token_tx
+            .send(token)
+            .map_err(|_e| windows::core::Error::from_win32())?;
+        watcher.Start()?;
+        Ok(())
+    }
+}
+#[derive(Debug)]
+pub enum DeviceQuery {
+    Address(u64),
+    Id(HSTRING),
+}
+#[derive(Debug)]
+pub enum SearcherSignal {
+    FindDevice(DeviceQuery),
+}
+unsafe impl Send for SearcherSignal {}
+pub struct DeviceSearcher {
+    input_task: tokio::task::JoinHandle<()>,
+    input_tx: tokio::sync::mpsc::UnboundedSender<SearcherSignal>,
+    rt: tokio::runtime::Runtime,
+}
+impl Drop for DeviceSearcher {
+    fn drop(&mut self) {
+        self.input_task.abort()
+    }
+}
+type StatusVerifier = Box<dyn Fn(bool) + Send>;
+type BLStatusHandler = TypedEventHandler<BluetoothLEDevice, IInspectable>;
+impl DeviceSearcher {
+    /// Helper which makes the code smol
+    async fn get_device_by_address(bluetoothaddress: u64) -> Option<DeviceWrapper> {
+        let Ok(device_future) = BluetoothLEDevice::FromBluetoothAddressAsync(bluetoothaddress)
+        else {
+            return None;
+        };
+        let Ok(device) = device_future.await else {
+            return None;
+        };
+        let verifier: StatusVerifier = Box::new(|status| println!("{}", status));
+        let handler: BLStatusHandler = TypedEventHandler::new(
+            move |devopt: &Option<BluetoothLEDevice>, _args: &Option<IInspectable>| {
+                if let Some(device) = devopt {
+                    let connected: bool = device.ConnectionStatus().ok().map_or(false, |status| {
+                        status == BluetoothConnectionStatus::Connected
+                    });
+                    verifier(connected);
+                };
+
+                Ok(())
+            },
+        );
+        let Ok(token) = device.ConnectionStatusChanged(&handler) else {
+            return None;
+        };
+        Some(DeviceWrapper {
+            device,
+            token,
+            services: vec![],
         })
     }
-    pub fn start(mut self) -> anyhow::Result<PeripheralTerminal> {
-        let (peripheral_tx, peripheral_rx) =
-            tokio::sync::mpsc::channel(std::mem::size_of::<Peripheral>());
-        let adapter = self.adapter.clone();
-        tokio::task::spawn(async move {
-            let _ = adapter.start_scan(ScanFilter::default()).await.unwrap();
-            loop {
-                match self.discovery_rx.recv().await {
-                    Some(p) => match peripheral_tx.send(p).await {
-                        Ok(()) => continue,
-                        // We closed the receiver
-                        _ => break,
-                    },
-                    None => continue,
+    pub fn new(
+        output_tx: tokio::sync::mpsc::UnboundedSender<DeviceWrapper>,
+        timeout: Duration,
+    ) -> Self {
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+        let handle = rt.spawn(async move {
+            'main: loop {
+                println!("Still waiting");
+                match input_rx.recv().await {
+                    Some(signal) => {
+                        println!("DeviceSearcher: {:?}", signal);
+                        match signal {
+                            SearcherSignal::FindDevice(query) => match query {
+                                DeviceQuery::Address(bluetoothaddress) => {
+                                    let search_start = Instant::now();
+                                    'search: loop {
+                                        if search_start.elapsed() > timeout {
+                                            break 'search;
+                                        };
+                                        let Some(dw) =
+                                            Self::get_device_by_address(bluetoothaddress).await
+                                        else {
+                                            println!("nun");
+                                            continue;
+                                        };
+                                        match output_tx.send(dw) {
+                                            Ok(_) => println!("Sent"),
+                                            _ => {
+                                                println!("HELLO WTF");
+                                                break 'main;
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => todo!(),
+                            },
+                        }
+                    }
+                    None => {
+                        println!("Input transmitters gone");
+                        break;
+                    }
                 }
             }
         });
-        Ok(PeripheralTerminal { peripheral_rx })
+        Self {
+            input_task: handle,
+            input_tx,
+            rt,
+        }
+    }
+    pub fn send_signal(&self, signal: SearcherSignal) -> Result<(), SendError<SearcherSignal>> {
+        self.input_tx.send(signal)
     }
 }
-// impl Drop for BluetoothScanner {
-//     fn drop(&mut self) {
-//         self.discovery_rx.close()
-//     }
-// }
-pub struct PeripheralTerminal {
-    peripheral_rx: tokio::sync::mpsc::Receiver<Peripheral>,
+pub struct DeviceWrapper {
+    device: BluetoothLEDevice,
+    token: EventRegistrationToken,
+    services: Vec<GattDeviceService>,
 }
-impl PeripheralTerminal {
-    pub fn new() -> anyhow::Result<Self> {
-        let bt_scanner = BluetoothScanner::new()?;
-        bt_scanner.start()
-    }
-    pub fn filter_reception(mut self, query: DeviceQuery) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<Peripheral>> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::task::spawn(async move {
-            loop {
-                let (props, p)= match self.peripheral_rx.recv().await {
-                    Some(p) => (p.properties().await.unwrap().unwrap(), p),
-                    None => continue
-                };
-                match query {
-                    DeviceQuery::ByName(ref name) if props.local_name.unwrap_or_default().eq(name) => tx.send(p).unwrap(),
-                    DeviceQuery::ByUuid(uuid) if props.services.into_iter().find(|value| value.eq(&uuid)).is_some() => tx.send(p).unwrap(),
-                    DeviceQuery::ByAddress(ref addr) if props.address.to_string().eq(addr) => tx.send(p).unwrap(),
-                    _ => continue
-                }
-            }
-        });
-        Ok(rx)
-    }
-}
-impl Drop for PeripheralTerminal {
-    fn drop(&mut self) {
-        self.peripheral_rx.close();
-    }
-}
-pub struct PeripheralSearcher {
-    terminal: PeripheralTerminal
-}
-impl PeripheralSearcher {
-    pub fn new() -> anyhow::Result<Self> {
-        let x = tokio::task::spawn()
-    }
-    pub fn search_by(self, query: DeviceQuery) -> anyhow::Result<Peripheral> {
-        todo!()
-    }
-}
-
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+impl DeviceWrapper {}
